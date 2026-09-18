@@ -14,13 +14,16 @@ from app.schemas.schemas import (
     SeatMapCell,
     SeatMapOut,
     ShowtimeOut,
+    TrialCandidateOut,
+    TrialOut,
 )
 from app.services.bond_engine import (
+    Candidate,
     HoldSpan,
     SeatCell,
     conflicts_with,
-    find_bond_across_rows,
-    find_contiguous_block,
+    hall_centerline,
+    score_candidates,
 )
 
 api_router = APIRouter()
@@ -34,6 +37,39 @@ def _aisles(hall: Hall) -> list[int]:
 
 def _hall_out(h: Hall) -> HallOut:
     return HallOut(id=h.id, name=h.name, rows=h.rows, cols=h.cols, aisle_cols=_aisles(h))
+
+
+def _load_layout(
+    db: Session, showtime_id: int
+) -> tuple[Showtime, Hall, list[HoldSpan], dict[int, list[SeatCell]]]:
+    st = db.get(Showtime, showtime_id)
+    if not st:
+        raise HTTPException(404, "场次不存在")
+    hall = db.get(Hall, st.hall_id)
+    assert hall
+    aisles = set(_aisles(hall))
+    existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == showtime_id)).all()
+    holds = [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in existing]
+    seats_by_row: dict[int, list[SeatCell]] = {
+        r: [SeatCell(row=r, col=c, is_aisle=c in aisles) for c in range(1, hall.cols + 1)]
+        for r in range(1, hall.rows + 1)
+    }
+    return st, hall, holds, seats_by_row
+
+
+def _rank_candidates(
+    hall: Hall,
+    holds: list[HoldSpan],
+    seats_by_row: dict[int, list[SeatCell]],
+    party_size: int,
+    preferred_row: int | None,
+) -> list[Candidate]:
+    """Center-preference ranking; a preferred row pins selection to that row when it fits."""
+    if preferred_row is not None:
+        pinned = score_candidates(seats_by_row, holds, party_size, hall.cols, restrict_row=preferred_row)
+        if pinned:
+            return pinned
+    return score_candidates(seats_by_row, holds, party_size, hall.cols)
 
 
 @api_router.get("/health")
@@ -110,30 +146,50 @@ def list_conflicts(db: Session = Depends(get_db)):
     return db.scalars(select(ConflictLog).order_by(ConflictLog.id.desc())).all()
 
 
+@api_router.get("/trial", response_model=TrialOut)
+def trial(
+    showtime_id: int,
+    party_size: int,
+    preferred_row: int | None = None,
+    db: Session = Depends(get_db),
+):
+    """Dry-run: return all fitting candidate segments ranked by center preference.
+
+    Nothing is persisted. ``selected`` is the single block a subsequent lock would
+    take (under the same holds); POST /holds re-ranks and re-checks overlap at
+    write time.
+    """
+    if party_size < 1 or party_size > 12:
+        raise HTTPException(422, "人数需在 1-12 之间")
+    _st, hall, holds, seats_by_row = _load_layout(db, showtime_id)
+    ranked = _rank_candidates(hall, holds, seats_by_row, party_size, preferred_row)
+    payload = [
+        TrialCandidateOut(
+            row=c.row,
+            start_col=c.start_col,
+            end_col=c.end_col,
+            seg_start_col=c.seg_start_col,
+            seg_end_col=c.seg_end_col,
+            score=c.score,
+            distance=c.distance,
+        )
+        for c in ranked
+    ]
+    return TrialOut(
+        showtime_id=showtime_id,
+        party_size=party_size,
+        centerline=hall_centerline(hall.cols),
+        candidates=payload,
+        selected=payload[0] if payload else None,
+    )
+
+
 @api_router.post("/holds", response_model=HoldOut)
 def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
-    st = db.get(Showtime, body.showtime_id)
-    if not st:
-        raise HTTPException(404, "场次不存在")
-    hall = db.get(Hall, st.hall_id)
-    assert hall
-    aisles = set(_aisles(hall))
-    existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == body.showtime_id)).all()
-    holds = [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in existing]
-    seats_by_row: dict[int, list[SeatCell]] = {}
-    for r in range(1, hall.rows + 1):
-        seats_by_row[r] = [
-            SeatCell(row=r, col=c, is_aisle=c in aisles) for c in range(1, hall.cols + 1)
-        ]
+    _st, hall, holds, seats_by_row = _load_layout(db, body.showtime_id)
 
-    block = None
-    if body.preferred_row:
-        block = find_contiguous_block(
-            seats_by_row.get(body.preferred_row, []), holds, body.preferred_row, body.party_size
-        )
-    if block is None:
-        block = find_bond_across_rows(seats_by_row, holds, body.party_size)
-    if block is None:
+    ranked = _rank_candidates(hall, holds, seats_by_row, body.party_size, body.preferred_row)
+    if not ranked:
         db.add(
             ConflictLog(
                 showtime_id=body.showtime_id,
@@ -144,6 +200,9 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(409, "无足够连续空座")
 
+    block = ranked[0].span
+
+    # Overlap detection stays the final gate before persisting.
     hits = conflicts_with(holds, block)
     if hits:
         db.add(

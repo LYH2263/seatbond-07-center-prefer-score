@@ -61,3 +61,21 @@ class SeatMapOut(BaseModel):
     rows: int
     cols: int
     cells: list[SeatMapCell]
+
+
+class TrialCandidateOut(BaseModel):
+    row: int
+    start_col: int  # block coordinates that would actually be locked
+    end_col: int
+    seg_start_col: int  # containing free segment (aisle/hold-bounded)
+    seg_end_col: int
+    score: float  # -distance of the segment midpoint to the hall centerline
+    distance: float
+
+
+class TrialOut(BaseModel):
+    showtime_id: int
+    party_size: int
+    centerline: float
+    candidates: list[TrialCandidateOut]  # best first; tie: row asc, start_col asc
+    selected: TrialCandidateOut | None = None
