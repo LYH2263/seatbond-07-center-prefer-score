@@ -38,6 +38,35 @@ class HoldRequest(BaseModel):
     preferred_row: int | None = None
 
 
+class CandidateOut(BaseModel):
+    """试算候选段：恰好 party_size 的连续空座块。"""
+
+    rank: int
+    row: int
+    start_col: int
+    end_col: int
+    center: float
+    distance: float
+    score: float
+
+
+class PreviewResponse(BaseModel):
+    showtime_id: int
+    party_size: int
+    hall_center: float
+    candidates: list[CandidateOut]
+
+
+class HoldResultOut(BaseModel):
+    """锁座响应：落库持座 + 选中块得分与完整候选排序，便于与试算核对。"""
+
+    hold: HoldOut
+    hall_center: float
+    score: float
+    distance: float
+    candidates: list[CandidateOut]
+
+
 class ConflictOut(BaseModel):
     id: int
     showtime_id: int

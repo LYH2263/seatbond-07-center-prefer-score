@@ -7,20 +7,25 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.models import ConflictLog, Hall, SeatHold, Showtime
 from app.schemas.schemas import (
+    CandidateOut,
     ConflictOut,
     HallOut,
     HoldOut,
     HoldRequest,
+    HoldResultOut,
+    PreviewResponse,
     SeatMapCell,
     SeatMapOut,
     ShowtimeOut,
 )
 from app.services.bond_engine import (
+    Candidate,
     HoldSpan,
     SeatCell,
     conflicts_with,
-    find_bond_across_rows,
-    find_contiguous_block,
+    hall_center,
+    rank_candidates,
+    select_block,
 )
 
 api_router = APIRouter()
@@ -34,6 +39,31 @@ def _aisles(hall: Hall) -> list[int]:
 
 def _hall_out(h: Hall) -> HallOut:
     return HallOut(id=h.id, name=h.name, rows=h.rows, cols=h.cols, aisle_cols=_aisles(h))
+
+
+def _seats_by_row(hall: Hall) -> dict[int, list[SeatCell]]:
+    aisles = set(_aisles(hall))
+    return {
+        r: [SeatCell(row=r, col=c, is_aisle=c in aisles) for c in range(1, hall.cols + 1)]
+        for r in range(1, hall.rows + 1)
+    }
+
+
+def _existing_holds(db: Session, showtime_id: int) -> tuple[list[SeatHold], list[HoldSpan]]:
+    rows = db.scalars(select(SeatHold).where(SeatHold.showtime_id == showtime_id)).all()
+    return rows, [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in rows]
+
+
+def _candidate_out(cand: Candidate, rank: int) -> CandidateOut:
+    return CandidateOut(
+        rank=rank,
+        row=cand.row,
+        start_col=cand.start_col,
+        end_col=cand.end_col,
+        center=cand.center,
+        distance=cand.distance,
+        score=cand.score,
+    )
 
 
 @api_router.get("/health")
@@ -110,29 +140,44 @@ def list_conflicts(db: Session = Depends(get_db)):
     return db.scalars(select(ConflictLog).order_by(ConflictLog.id.desc())).all()
 
 
-@api_router.post("/holds", response_model=HoldOut)
+@api_router.post("/holds/preview", response_model=PreviewResponse)
+def preview_holds(body: HoldRequest, db: Session = Depends(get_db)):
+    """试算：返回所有满足人数的连续空座候选块（按居中得分排序），不落库。"""
+    st = db.get(Showtime, body.showtime_id)
+    if not st:
+        raise HTTPException(404, "场次不存在")
+    hall = db.get(Hall, st.hall_id)
+    assert hall
+    _, holds = _existing_holds(db, body.showtime_id)
+    seats = _seats_by_row(hall)
+    if body.preferred_row:
+        seats = {body.preferred_row: seats.get(body.preferred_row, [])}
+    candidates = rank_candidates(seats, holds, body.party_size, hall.cols)
+    return PreviewResponse(
+        showtime_id=body.showtime_id,
+        party_size=body.party_size,
+        hall_center=hall_center(hall.cols),
+        candidates=[_candidate_out(c, i + 1) for i, c in enumerate(candidates)],
+    )
+
+
+@api_router.post("/holds", response_model=HoldResultOut)
 def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
     st = db.get(Showtime, body.showtime_id)
     if not st:
         raise HTTPException(404, "场次不存在")
     hall = db.get(Hall, st.hall_id)
     assert hall
-    aisles = set(_aisles(hall))
-    existing = db.scalars(select(SeatHold).where(SeatHold.showtime_id == body.showtime_id)).all()
-    holds = [HoldSpan(row=h.row, start_col=h.start_col, end_col=h.end_col) for h in existing]
-    seats_by_row: dict[int, list[SeatCell]] = {}
-    for r in range(1, hall.rows + 1):
-        seats_by_row[r] = [
-            SeatCell(row=r, col=c, is_aisle=c in aisles) for c in range(1, hall.cols + 1)
-        ]
+    _, holds = _existing_holds(db, body.showtime_id)
+    seats = _seats_by_row(hall)
 
-    block = None
+    # 居中偏好：跨所有排统一打分排序；指定优先排时只在该排候选中取最高分。
+    all_candidates = rank_candidates(seats, holds, body.party_size, hall.cols)
     if body.preferred_row:
-        block = find_contiguous_block(
-            seats_by_row.get(body.preferred_row, []), holds, body.preferred_row, body.party_size
-        )
-    if block is None:
-        block = find_bond_across_rows(seats_by_row, holds, body.party_size)
+        candidates = [c for c in all_candidates if c.row == body.preferred_row]
+    else:
+        candidates = all_candidates
+    block = select_block(candidates)
     if block is None:
         db.add(
             ConflictLog(
@@ -144,6 +189,7 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(409, "无足够连续空座")
 
+    # 冲突重叠检测仍在落库前生效。
     hits = conflicts_with(holds, block)
     if hits:
         db.add(
@@ -168,4 +214,10 @@ def create_hold(body: HoldRequest, db: Session = Depends(get_db)):
     db.add(hold)
     db.commit()
     db.refresh(hold)
-    return hold
+    return HoldResultOut(
+        hold=HoldOut.model_validate(hold),
+        hall_center=hall_center(hall.cols),
+        score=candidates[0].score,
+        distance=candidates[0].distance,
+        candidates=[_candidate_out(c, i + 1) for i, c in enumerate(candidates)],
+    )
